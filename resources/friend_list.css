@@ -118,6 +118,19 @@ body {
     border: 1px solid rgba(0, 255, 255, 0.4);
 }
 
+/* 世界分组：标题是世界名，不用全大写，下面补一行房间 */
+.status-indicator.is-world .status-label {
+    text-transform: none;
+    letter-spacing: 0.5px;
+}
+
+.world-room {
+    margin: 8px 0 0 34px;
+    font-size: 13px;
+    color: #7f93a8;
+    letter-spacing: 0.5px;
+}
+
 /* 等宽3列 */
 .friends-grid {
     display: grid;
@@ -128,13 +141,14 @@ body {
 
 @media (min-width: 1400px) {
     .friends-grid {
-        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        /* auto-fill 而不是 auto-fit：只有一个人时卡片不会被拉成整行 */
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
     }
 }
 
 @media (max-width: 1399px) and (min-width: 901px) {
     .friends-grid {
-        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
     }
 }
 

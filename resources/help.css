@@ -61,6 +61,18 @@ body {
     opacity: 0.8;
 }
 
+.help-version {
+    display: inline-block;
+    margin-right: 8px;
+    padding: 1px 8px;
+    font-size: 12px;
+    letter-spacing: 0.5px;
+    color: var(--vr-cyan);
+    border: 1px solid rgba(0, 255, 255, 0.5);
+    border-radius: 8px;
+    background: rgba(0, 255, 255, 0.08);
+}
+
 /* 两列分组布局：先看类别，再看具体指令 */
 .help-cols {
     display: flex;

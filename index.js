@@ -19,6 +19,13 @@ import { DEFAULT_AVATAR } from './lib/utils.js'
 /* 2FA 待验证状态（仅内存，按 QQ 隔离） */
 const pending2fa = new Map()
 
+/* 验证方式的中文提示，跟 vrchat.js 的 pickTwoFactorMethod 对应 */
+const TWO_FA_HINT = {
+  totp: '6位数字（身份验证器）',
+  emailOtp: '6位数字（邮箱收到的验证码）',
+  otp: '恢复码（字母数字串）'
+}
+
 /* git 调用（#vrc更新 用）：execFile 传数组，不经过 shell，避免命令注入 */
 const execFileP = promisify(execFile)
 
@@ -49,6 +56,7 @@ const CMD_MAP = [
   ['查询世界', 'searchworld'],
   ['验证码', 'verify'],
   ['帮助', 'help'],
+  ['结果', 'result'],
   ['登录', 'login'],
   ['验证', 'verify'],
   ['通知', 'notify'],
@@ -59,8 +67,6 @@ const CMD_MAP = [
 ].sort((a, b) => b[0].length - a[0].length)
 
 const ACTION_RE = /^(接受|忽略|拒绝)\s*(\d{1,3})$/
-
-/* ---------------- 序号缓存 ---------------- */
 
 /* ---------------- 序号缓存（按 QQ + 类型隔离，互不覆盖） ---------------- */
 
@@ -93,22 +99,84 @@ function cacheGetLatest(qq, kinds) {
   return best
 }
 
+/* ---------------- 分页 ---------------- */
+
+const PAGE_SIZE = { user: 10, world: 20, fav: 24 }
+
+/** "#vrc结果 P2" / "p2" / "2" / "第2页" → 2；认不出来给 0 */
+function parsePageArg(text) {
+  const m = /^(?:[pP]|第)?\s*(\d{1,3})\s*页?$/.exec(String(text || '').trim())
+  return m ? Number(m[1]) : 0
+}
+
+/** 记一份「当前可翻页的列表」，供 #vrc结果 P2 用 */
+function pagerSet(qq, meta) {
+  cacheSet(qq, 'pager', meta)
+}
+
+/* ---------------- 版本号 ---------------- */
+
+function readPluginVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8'))
+    return String(pkg.version || '')
+  } catch {
+    return ''
+  }
+}
+
+const PLUGIN_VERSION = readPluginVersion()
+
+/** 收藏数据切页：按全局序号切，页内仍保留收藏组分块 */
+function sliceFavoritePage(groups, page, per) {
+  const total = groups.reduce((sum, g) => sum + g.entries.length, 0)
+  const totalPages = Math.max(1, Math.ceil(total / per))
+  const start = (page - 1) * per
+  const end = start + per
+  let cursor = 0
+  const pageGroups = []
+  for (const g of groups) {
+    const gStart = cursor
+    const gEnd = cursor + g.entries.length
+    cursor = gEnd
+    if (gEnd <= start || gStart >= end) continue
+    pageGroups.push({
+      title: g.title,
+      name: g.name,
+      total: g.entries.length,
+      shown: g.entries.slice(Math.max(0, start - gStart), Math.min(g.entries.length, end - gStart)),
+      more: 0
+    })
+  }
+  return { total, totalPages, start, pageGroups }
+}
+
 /* ---------------- 小工具 ---------------- */
 
-async function mapLimit(list, limit, fn) {
+/**
+ * 限并发批量执行。单项失败不拖垮整批，但会把失败项和原因记进日志
+ * @param {string} label 日志里用的名字，例如“好友位置装配”
+ */
+async function mapLimit(list, limit, fn, label = '批量任务') {
   const out = new Array(list.length)
   let cursor = 0
+  const failed = []
   const workers = Array.from({ length: Math.min(limit, list.length || 1) }, async () => {
     while (cursor < list.length) {
       const i = cursor++
       try {
         out[i] = await fn(list[i], i)
-      } catch {
+      } catch (err) {
         out[i] = null
+        failed.push(`#${i} ${err?.message || err}`)
       }
     }
   })
   await Promise.all(workers)
+  if (failed.length) {
+    const head = failed.slice(0, 3).join(' | ')
+    logger?.info?.(`[vrc-plugin] ${label}：${failed.length}/${list.length} 项失败，${head}${failed.length > 3 ? ' …' : ''}`)
+  }
   return out
 }
 
@@ -130,9 +198,8 @@ async function requireClient(e) {
   let client = await V.getClient(qq)
   let auth = await V.checkAuth(client)
 
-  // 首次请求常见两种失败：① 连接冷启动/首包超时 ② SDK 的 cookie jar 还没从
-  // users.json 恢复就发了请求。两者都表现为「未登录」，但重建一次 client
-  // 并重新恢复 cookie 就能拿到，所以这里统一重试一次，而不是直接让用户重发指令。
+  // 刚启动时第一次检查可能因为连接冷启动、或 cookie 还没恢复进 jar 而判成未登录，
+  // 这里重建一次 client 再查，用户不用手动重发指令。
   if (!auth.ok && !auth.need2fa) {
     logger?.warn?.(`[vrc-plugin] 首次登录态检查失败（error=${auth.error || 'unknown'} status=${auth.status ?? '-'}），重建会话重试`)
     V.dropClient(qq)
@@ -161,16 +228,36 @@ async function requireClient(e) {
 /* ---------------- 好友信息装配 ---------------- */
 
 async function buildFriendEntries(client, friends, nowMs = Date.now()) {
+  let locationFailed = 0
   // 第一阶段：算位置文案（在线好友要查世界名，已做 10 分钟缓存）
   const located = await mapLimit(friends, 6, async f => {
     let locationText
+    let worldId = ''
+    let worldName = ''
+    let roomLabel = ''
+    let region = null
     if (f.normalizedStatus === 'offline' || f.normalizedStatus === 'unknown') {
       const last = f.lastLogin ? new Date(f.lastLogin).getTime() : 0
       locationText = last ? V.tdFormat(nowMs - last) : '离线'
     } else if (f.normalizedStatus === 'webonline') {
       locationText = '网页在线（没进游戏）'
     } else if (f.location && f.location !== 'offline') {
-      locationText = await V.formatLocation(client, f.location)
+      try {
+        const desc = await V.describeLocation(client, f.location)
+        if (desc) {
+          locationText = desc.text
+          worldId = desc.worldId
+          worldName = desc.worldName
+          roomLabel = desc.roomLabel
+          region = desc.region
+        } else {
+          locationText = '在线，位置未公开'
+        }
+      } catch (err) {
+        // 位置查不出来也别把好友从列表里抹掉，标一下就行
+        locationFailed++
+        locationText = '获取失败'
+      }
     } else {
       locationText = '在线，位置未公开'
     }
@@ -182,15 +269,31 @@ async function buildFriendEntries(client, friends, nowMs = Date.now()) {
       normalizedStatus: f.normalizedStatus,
       originalStatus: f.originalStatus,
       statusDescription: f.statusDesc,
-      locationText
+      locationText,
+      location: f.location,
+      worldId,
+      worldName,
+      roomLabel,
+      region
     }
-  })
+  }, '好友位置装配')
+  if (locationFailed) logger?.info?.(`[vrc-plugin] 好友位置：${locationFailed}/${friends.length} 条获取失败`)
 
   // 第二阶段：头像转 data URI（并发 8，单个 4s 超时）
+  let avatarFailed = 0
   const withAvatar = config.avatarBase64
-    ? await mapLimit(located, 8, async item => ({ ...item, avatar: await toDataUri(item.avatarUrl) }))
-    : located.map(item => ({ ...item, avatar: DEFAULT_AVATAR }))
+    ? await mapLimit(located, 8, async item => {
+        let avatar = DEFAULT_AVATAR
+        try {
+          avatar = await toDataUri(item.avatarUrl)
+        } catch (err) {
+          avatarFailed++
+        }
+        return { ...item, avatar }
+      }, '好友头像转换')
+    : located.map(item => (item ? { ...item, avatar: DEFAULT_AVATAR } : null))
 
+  if (avatarFailed) logger?.info?.(`[vrc-plugin] 好友头像：${avatarFailed}/${located.length} 张转换失败，已用默认图`)
   return withAvatar.filter(Boolean)
 }
 
@@ -343,6 +446,8 @@ export class VrcPlugin extends plugin {
       switch (cmd) {
         case 'help':
           return await this.showHelp(e)
+        case 'result':
+          return await this.doResult(e, args)
         case 'login':
           return await this.doLogin(e, args)
         case 'verify':
@@ -414,7 +519,7 @@ export class VrcPlugin extends plugin {
         {
           title: '收藏',
           items: [
-            { cmd: '#vrc收藏列表 avatar|world', desc: '按收藏组列出收藏，带缩略图' },
+            { cmd: '#vrc收藏列表 avatar|world', desc: '按收藏组出图，每页 24 项，加页码翻页' },
             { cmd: '#vrc收藏组列表', desc: '查看收藏组与容量' }
           ]
         }
@@ -423,9 +528,10 @@ export class VrcPlugin extends plugin {
         {
           title: '好友与玩家',
           items: [
-            { cmd: '#vrc全部好友', desc: '拉全部好友，出在线 / 离线分组图' },
+            { cmd: '#vrc全部好友', desc: '在线按世界+房间分组，离线单独一组' },
             { cmd: '#vrc搜索用户 关键词', desc: '搜索玩家，出结果列表图' },
-            { cmd: '#vrc用户 序号', desc: '看第 N 个玩家的资料卡' },
+            { cmd: '#vrc结果 P2', desc: '翻页，玩家 / 世界 / 收藏都能翻' },
+            { cmd: '#vrc用户 序号', desc: '看第 N 个玩家的资料卡，序号按当前页算' },
             { cmd: '#vrc加好友 序号', desc: '给第 N 个玩家发好友请求' },
             { cmd: '#vrc好友状态 序号', desc: '查与第 N 个玩家的好友关系' }
           ]
@@ -437,10 +543,17 @@ export class VrcPlugin extends plugin {
             { cmd: '#vrc接受 序号', desc: '接受第 N 条好友申请' },
             { cmd: '#vrc忽略 / 拒绝 序号', desc: '忽略或拒绝第 N 条好友申请' }
           ]
+        },
+        {
+          title: '插件维护',
+          items: [
+            { cmd: '#vrc更新', desc: '拉取仓库最新代码，仅主人可用' },
+            { cmd: '#vrc强制更新', desc: '丢弃本地改动强制更新，仅主人可用' }
+          ]
         }
       ]
     ]
-    const file = await renderHtml(VIEW.renderHelp(columns), {
+    const file = await renderHtml(VIEW.renderHelp(columns, PLUGIN_VERSION), {
       width: config.viewport.worldList,
       quality: config.jpegQuality
     })
@@ -480,8 +593,13 @@ export class VrcPlugin extends plugin {
     }
     if (r.need2fa) {
       pending2fa.set(String(e.user_id), { at: Date.now(), methods: r.methods })
+      const hints = (r.methods || []).map(m => TWO_FA_HINT[m]).filter(Boolean).join(' / ')
+      const ambiguous = r.methods.includes('totp') && r.methods.includes('emailOtp')
       await e.reply(
-        `该账号需要二次验证，可用方式：${r.methods.join(' / ')}\n请在 ${config.sessionTimeout} 秒内发送：#vrc验证 你的验证码${RECALL_TIP}`
+        `该账号需要二次验证，可用方式：${hints || r.methods.join(' / ')}\n` +
+        `请在 ${config.sessionTimeout} 秒内发送：#vrc验证 你的验证码` +
+        (ambiguous ? '\n两种数字码走的是不同接口，请标明：#vrc验证 email 123456 或 #vrc验证 totp 123456' : '') +
+        RECALL_TIP
       )
       return true
     }
@@ -490,33 +608,61 @@ export class VrcPlugin extends plugin {
   }
 
   async doVerify(e, args) {
-    const code = (args[0] || '').trim()
+    let code = (args[0] || '').trim()
     if (!code) {
       await e.reply('用法：#vrc验证 你的验证码')
-      return true
-    }
-    if (!/^\d{4,8}$/.test(code) && code.length < 4) {
-      await e.reply(T_LOGIN.invalid_2fa_format)
       return true
     }
     if (!e.isPrivate) {
       await e.reply('验证码不要在群里发送，请私聊我发送：#vrc验证 你的验证码')
       return true
     }
-
     const pending = pending2fa.get(String(e.user_id))
     if (!pending || Date.now() - pending.at > config.sessionTimeout * 1000) {
       await e.reply('本次登录已超时，请重新执行 #vrc登录 账号 密码')
       return true
     }
 
+    // 可选前缀：账号同时支持身份验证器和邮箱码时，用它指定走哪个
+    // #vrc验证 email 123456 / #vrc验证 totp 123456 / #vrc验证 otp 恢复码
+    const parsed = V.parseTwoFactorInput(args, pending.methods)
+    if (parsed.error === 'unsupported') {
+      await e.reply(`这个账号不支持这种方式：${parsed.prefix}`)
+      return true
+    }
+    if (parsed.error === 'need_code') {
+      await e.reply('用法：#vrc验证 你的验证码\n同时支持多种方式时可写成 #vrc验证 email 123456 / #vrc验证 totp 123456 / #vrc验证 otp 恢复码')
+      return true
+    }
+    code = parsed.code
+
+    // 按服务端给出的可用方式判断验证码形态，不按固定位数卡
+    const method = V.pickTwoFactorMethod(code, parsed.scope)
+    if (!method) {
+      const hints = parsed.scope.map(m => TWO_FA_HINT[m]).filter(Boolean)
+      await e.reply(
+        `${T_LOGIN.invalid_2fa_format}${hints.length ? `\n这个账号可用：${hints.join(' / ')}` : ''}`
+      )
+      return true
+    }
+
     const client = await V.getClient(e.user_id)
-    const r = await V.submitTwoFactor(client, code, pending.methods)
+    const r = await V.submitTwoFactor(client, code, method)
     if (r.ok) {
       pending2fa.delete(String(e.user_id))
       await V.persistSession(e.user_id, client, r.user)
       await e.reply(T_LOGIN.logged_in.replace('{name}', r.user.displayName || r.user.userId))
       return true
+    }
+
+    // 只统计“验证码错误”，限流误伤的不算次数
+    if (r.error === '验证码错误') {
+      pending.tries = (pending.tries || 0) + 1
+      if (pending.tries >= 5) {
+        pending2fa.delete(String(e.user_id))
+        await e.reply(`${T_LOGIN.invalid_2fa_code}\n连续 5 次没通过，请重新执行 #vrc登录 账号 密码`)
+        return true
+      }
     }
     await e.reply(`${T_LOGIN.invalid_2fa_code}\n（${r.error}）`)
     return true
@@ -586,9 +732,20 @@ export class VrcPlugin extends plugin {
     }
     cacheSet(e.user_id, 'friends', ordered)
 
+    const worldSections = sections.filter(s => s.kind === 'world')
+    const worldCount = new Set(worldSections.map(s => s.worldId || s.worldName)).size
+    const onlineCount = sections
+      .filter(s => s.kind === 'world' || s.status !== 'offline')
+      .reduce((sum, s) => sum + s.friends.length, 0)
+
     const html = VIEW.renderFriendList(sections, words.friend_list)
     const file = await renderHtml(html, { width: config.viewport.friend, quality: config.jpegQuality })
-    await e.reply([imgSegment(file), `\n共 ${ordered.length} 位好友，发送 #vrc用户 序号 可以查看某个好友的资料卡`])
+    await e.reply([
+      imgSegment(file),
+      `\n共 ${ordered.length} 位好友，在线 ${onlineCount} 人${
+        worldCount ? `，分布在 ${worldCount} 个世界（${worldSections.length} 个房间）` : ''
+      }\n发送 #vrc用户 序号 可以查看某个好友的资料卡`
+    ])
     return true
   }
 
@@ -600,16 +757,38 @@ export class VrcPlugin extends plugin {
       await e.reply(`用法：#vrc搜索用户 关键词\n（${T_USER.send_user_name}）`)
       return true
     }
+    return await this.renderUserSearch(e, keyword, 1)
+  }
+
+  /**
+   * 搜索玩家并出第 page 页的图
+   * 每页 10 个，多取一条用来判断后面还有没有下一页（接口本身不返回总数）
+   */
+  async renderUserSearch(e, keyword, page = 1) {
     const ctx = await requireClient(e)
     if (!ctx) return true
+    const per = PAGE_SIZE.user
 
-    await e.reply('正在搜索并生成结果图，请稍候…')
-    const users = await V.searchUsers(ctx.client, keyword, { n: 10 })
-    if (!users.length) {
-      await e.reply(T_USER.no_user_found)
+    await e.reply(page === 1 ? '正在搜索并生成结果图，请稍候…' : `正在翻到第 ${page} 页…`)
+
+    let raw
+    try {
+      raw = await V.searchUsers(ctx.client, keyword, { n: per + 1, offset: (page - 1) * per })
+    } catch (err) {
+      await e.reply(`搜索失败：${err?.message || err}`)
       return true
     }
+    const hasMore = raw.length > per
+    const users = raw.slice(0, per)
+    if (!users.length) {
+      await e.reply(
+        page > 1 ? `第 ${page} 页没有结果了，用 #vrc结果 P${page - 1} 回上一页` : T_USER.no_user_found
+      )
+      return true
+    }
+
     cacheSet(e.user_id, 'user', users)
+    pagerSet(e.user_id, { kind: 'user', keyword, page, hasMore })
 
     const nowMs = Date.now()
     const entries = await mapLimit(users, 4, async (u, i) => {
@@ -620,25 +799,64 @@ export class VrcPlugin extends plugin {
       } else if (u.normalizedStatus === 'webonline') {
         locationText = '网页在线'
       } else if (u.location && u.location !== 'offline') {
-        locationText = await V.formatLocation(ctx.client, u.location)
+        try {
+          locationText = await V.formatLocation(ctx.client, u.location)
+        } catch (err) {
+          locationText = '获取失败'
+        }
       } else {
         // 搜索接口返回的是 LimitedUser，出于隐私不带 location，这一行索性不显示
         locationText = ''
       }
+      let avatar = DEFAULT_AVATAR
+      try {
+        avatar = await avatarForUser(u)
+      } catch (err) {
+        logger?.info?.(`[vrc-plugin] 搜索结果头像获取失败：${err?.message || err}`)
+      }
       return {
         index: i + 1,
         displayName: u.displayName,
-        avatar: await avatarForUser(u),
+        avatar,
         trust: u.trust,
         statusText: u.statusDesc || VIEW.statusDescOf(u.normalizedStatus) || '',
         locationText
       }
-    })
+    }, '搜索结果装配')
 
     const list = entries.filter(Boolean)
-    const html = VIEW.renderUserList(list, `搜索结果 · ${keyword}`)
+    const html = VIEW.renderUserList(list, `搜索结果 · ${keyword}`, { page, hasMore })
     const file = await renderHtml(html, { width: 820, quality: config.jpegQuality })
-    await e.reply([imgSegment(file), `\n发送 #vrc用户 序号 查看资料卡，例如：#vrc用户 1`])
+    const tip = hasMore
+      ? `发送 #vrc用户 序号 查看资料卡；翻页发 #vrc结果 P${page + 1}（p${page + 1} 也行）`
+      : page > 1
+        ? `发送 #vrc用户 序号 查看资料卡；已经是最后一页，回上一页发 #vrc结果 P${page - 1}`
+        : '发送 #vrc用户 序号 查看资料卡（结果只有这一页）'
+    await e.reply([imgSegment(file), `\n第 ${page} 页：${tip}`])
+    return true
+  }
+
+  /* ---------------- 翻页 ---------------- */
+
+  async doResult(e, args) {
+    const page = parsePageArg(args[0])
+    if (!page) {
+      await e.reply('用法：#vrc结果 P2（翻到第 2 页，p2、2 都行）')
+      return true
+    }
+    if (page > 50) {
+      await e.reply('页码太大了，最多翻到第 50 页')
+      return true
+    }
+    const meta = cacheGet(e.user_id, 'pager')
+    if (!meta) {
+      await e.reply('没有能翻页的列表，先发 #vrc搜索用户 关键词 / #vrc搜索世界 关键词 / #vrc收藏列表 world')
+      return true
+    }
+    if (meta.kind === 'user') return await this.renderUserSearch(e, meta.keyword, page)
+    if (meta.kind === 'world') return await this.renderWorldSearch(e, meta.keyword, page)
+    if (meta.kind === 'fav') return await this.doFavoriteList(e, [meta.type, String(page)])
+    await e.reply('这份列表不支持翻页')
     return true
   }
 
@@ -696,22 +914,43 @@ export class VrcPlugin extends plugin {
       await e.reply(`用法：#vrc搜索世界 关键词\n（${T_WORLD.send_world_name}）`)
       return true
     }
+    return await this.renderWorldSearch(e, keyword, 1)
+  }
+
+  /** 搜索世界并出第 page 页的图，每页 20 个，多取一条判断下一页 */
+  async renderWorldSearch(e, keyword, page = 1) {
     const ctx = await requireClient(e)
     if (!ctx) return true
+    const per = PAGE_SIZE.world
 
-    const worlds = await V.searchWorlds(ctx.client, keyword, { n: 20 })
+    await e.reply(page === 1 ? '正在搜索世界，请稍候…' : `正在翻到第 ${page} 页…`)
+    let raw
+    try {
+      raw = await V.searchWorlds(ctx.client, keyword, { n: per + 1, offset: (page - 1) * per })
+    } catch (err) {
+      await e.reply(`搜索失败：${err?.message || err}`)
+      return true
+    }
+    const hasMore = raw.length > per
+    const worlds = raw.slice(0, per)
     if (!worlds.length) {
-      await e.reply(T_WORLD.no_world_found)
+      await e.reply(
+        page > 1 ? `第 ${page} 页没有结果了，用 #vrc结果 P${page - 1} 回上一页` : T_WORLD.no_world_found
+      )
       return true
     }
 
     cacheSet(e.user_id, 'world', worlds)
-    const html = VIEW.renderWorldList(worlds)
+    pagerSet(e.user_id, { kind: 'world', keyword, page, hasMore })
+
+    const html = VIEW.renderWorldList(worlds, { page, hasMore })
     const file = await renderHtml(html, { width: config.viewport.worldList, quality: config.jpegQuality })
-    await e.reply([
-      imgSegment(file),
-      `\n发送 #vrc世界 序号 可以查看某个世界的详情，例如：#vrc世界 1`
-    ])
+    const tip = hasMore
+      ? `发送 #vrc世界 序号 查看详情；翻页发 #vrc结果 P${page + 1}（p${page + 1} 也行）`
+      : page > 1
+        ? `发送 #vrc世界 序号 查看详情；已经是最后一页，回上一页发 #vrc结果 P${page - 1}`
+        : '发送 #vrc世界 序号 查看详情（结果只有这一页）'
+    await e.reply([imgSegment(file), `\n第 ${page} 页：${tip}`])
     return true
   }
 
@@ -813,72 +1052,88 @@ export class VrcPlugin extends plugin {
       await e.reply(`用法：#vrc收藏列表 avatar 或 world\n（${T_FAV.send_favorite_type}）`)
       return true
     }
+    // 第二个参数是页码，也接受 #vrc结果 P2 那种写法
+    const page = Math.max(1, parsePageArg(args[1]) || 1)
+
     const ctx = await requireClient(e)
     if (!ctx) return true
 
-    // 收藏本体只有引用 ID，名字和图要按收藏组反查，所以按组拉一次再合并
-    let groups
-    try {
-      groups = await V.getFavoriteGroups(ctx.client, { n: 100 })
-    } catch (err) {
-      await e.reply(`读取收藏组失败：${err?.message || err}`)
-      return true
-    }
-    const typed = groups.filter(g => g.type === type)
-    if (!typed.length) {
-      await e.reply(T_FAV.empty_favorite_list.replace('{type}', type))
-      return true
-    }
+    // 收藏内容一次能全拿到，先缓存整份数据，翻页就不用反复请求
+    let data = cacheGet(e.user_id, 'favData')
+    if (!data || data.type !== type) {
+      let groups
+      try {
+        groups = await V.getFavoriteGroups(ctx.client, { n: 100 })
+      } catch (err) {
+        await e.reply(`读取收藏组失败：${err?.message || err}`)
+        return true
+      }
+      const typed = groups.filter(g => g.type === type)
+      if (!typed.length) {
+        await e.reply(T_FAV.empty_favorite_list.replace('{type}', type))
+        return true
+      }
 
-    const fetched = await Promise.all(
-      typed.map(async g => {
-        const base = { title: g.displayName || g.name, name: g.name }
-        try {
-          const entries = await V.getFavoriteGroupContents(ctx.client, type, g.name)
-          return { ...base, entries }
-        } catch (err) {
-          return { ...base, entries: [], error: String(err?.message || err) }
-        }
-      })
-    )
-
-    const PER_GROUP = 24
-    const sections = fetched
-      .filter(s => s.entries.length)
-      .map(s => ({
-        ...s,
-        total: s.entries.length,
-        shown: s.entries.slice(0, PER_GROUP),
-        more: Math.max(0, s.entries.length - PER_GROUP)
-      }))
-    if (!sections.length) {
-      const firstErr = fetched.find(s => s.error)
-      await e.reply(
-        firstErr
-          ? `读取收藏内容失败：${firstErr.error}`
-          : `${T_FAV.empty_favorite_list.replace('{type}', type)}\n（你有 ${typed.length} 个${type} 收藏组，但里面都是空的）`
+      // 收藏本体只有引用 ID，名字和图要按收藏组反查，所以按组拉一次再合并
+      const fetched = await Promise.all(
+        typed.map(async g => {
+          const base = { title: g.displayName || g.name, name: g.name }
+          try {
+            const entries = await V.getFavoriteGroupContents(ctx.client, type, g.name)
+            return { ...base, entries }
+          } catch (err) {
+            return { ...base, entries: [], error: String(err?.message || err) }
+          }
+        })
       )
+      const filled = fetched.filter(s => s.entries.length)
+      if (!filled.length) {
+        const firstErr = fetched.find(s => s.error)
+        await e.reply(
+          firstErr
+            ? `读取收藏内容失败：${firstErr.error}`
+            : `${T_FAV.empty_favorite_list.replace('{type}', type)}\n（你有 ${typed.length} 个${type} 收藏组，但里面都是空的）`
+        )
+        return true
+      }
+      data = { type, groups: filled }
+      cacheSet(e.user_id, 'favData', data)
+    }
+
+    const per = PAGE_SIZE.fav
+    const { total, totalPages, start, pageGroups } = sliceFavoritePage(data.groups, page, per)
+    if (page > totalPages) {
+      await e.reply(`总共就 ${totalPages} 页，用 #vrc收藏列表 ${type} ${totalPages} 看最后一页`)
       return true
     }
 
     // 缩略图在服务端取好（浏览器端取图会被 VRChat 的鉴权/代理卡住），失败就留空走默认图
-    const sectionsWithThumb = await mapLimit(sections, 2, async s => ({
+    const sectionsWithThumb = await mapLimit(pageGroups, 2, async s => ({
       ...s,
       shown: await mapLimit(s.shown, 10, async it => {
         if (!it.thumb) return it
-        const dataUri = await toDataUri(it.thumb)
-        return { ...it, thumb: dataUri === DEFAULT_AVATAR ? '' : dataUri }
-      })
-    }))
+        try {
+          const dataUri = await toDataUri(it.thumb)
+          return { ...it, thumb: dataUri === DEFAULT_AVATAR ? '' : dataUri }
+        } catch (err) {
+          return { ...it, thumb: '' }
+        }
+      }, '收藏缩略图')
+    }), '收藏组装配')
 
-    const total = sectionsWithThumb.reduce((sum, s) => sum + (s.total ?? 0), 0)
-    const file = await renderHtml(VIEW.renderFavoriteList(sectionsWithThumb, type), {
-      width: config.viewport.worldList,
-      quality: config.jpegQuality
-    })
+    pagerSet(e.user_id, { kind: 'fav', type, page })
+
+    const file = await renderHtml(
+      VIEW.renderFavoriteList(sectionsWithThumb, type, { page, totalPages, startIndex: start, total }),
+      { width: config.viewport.worldList, quality: config.jpegQuality }
+    )
+    const pageTip =
+      page < totalPages
+        ? `翻页：#vrc收藏列表 ${type} ${page + 1}（#vrc结果 P${page + 1} 也行）`
+        : `已经是最后一页${page > 1 ? `，回上一页：#vrc收藏列表 ${type} ${page - 1}` : ''}`
     await e.reply([
       imgSegment(file),
-      `\n收藏列表（${type}）：${sectionsWithThumb.length} 个组 / 共 ${total} 项\n加新的世界：先 #vrc搜索世界，再 #vrc收藏世界 序号 [组名]`
+      `\n收藏列表（${type}）：${data.groups.length} 个组 / 共 ${total} 项 · 第 ${page} / ${totalPages} 页\n${pageTip}\n加新的世界：先 #vrc搜索世界，再 #vrc收藏世界 序号 [组名]`
     ])
     return true
   }
@@ -1103,8 +1358,7 @@ export class VrcPlugin extends plugin {
       const branch = (await run(['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim()
       await run(['fetch', '--all', '--prune'])
 
-      // 分支不一定有 upstream 跟踪（改过 remote、远端默认分支不同都会踩到），
-      // 所以统一按「origin/<当前分支>」，取不到再用 origin/HEAD，绕开 tracking 问题
+      // 不依赖 upstream 跟踪关系：先取 origin/<当前分支>，没有再用 origin/HEAD
       let remoteRef = `origin/${branch}`
       const hasRef = await run(['rev-parse', '--verify', '--quiet', remoteRef])
         .then(() => true)

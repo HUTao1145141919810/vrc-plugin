@@ -15,3 +15,6 @@ temp/
 *.bak
 .DS_Store
 Thumbs.db
+data/users.json.bak
+data/users.json.*.tmp
+data/*.key
