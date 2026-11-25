@@ -1,0 +1,21 @@
+{
+  "name": "vrc-plugin",
+  "version": "1.0.0",
+  "description": "云崽（Yunzai / Miao / TRSS）版 VRChat 查询插件，移植自 nonebot_plugin_vrchat",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "yunzai",
+    "trss-yunzai",
+    "vrchat",
+    "qqbot",
+    "plugin"
+  ],
+  "dependencies": {
+    "vrchat": "^2.26.0"
+  },
+  "optionalDependencies": {
+    "https-proxy-agent": "^7.0.6"
+  }
+}
