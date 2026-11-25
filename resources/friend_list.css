@@ -131,6 +131,22 @@ body {
     letter-spacing: 0.5px;
 }
 
+/* 位置不可见（私有世界 / 加载中 / 获取失败）：琥珀色，和可见世界区分开 */
+.status-indicator.is-hidden {
+    background: rgba(250, 173, 20, 0.1);
+    border-left-color: #faad14;
+}
+
+.status-indicator.is-hidden .status-label {
+    color: #faad14;
+    text-transform: none;
+    letter-spacing: 0.5px;
+}
+
+.status-indicator.is-hidden .friend-counter {
+    background: rgba(250, 173, 20, 0.18);
+}
+
 /* 等宽3列 */
 .friends-grid {
     display: grid;

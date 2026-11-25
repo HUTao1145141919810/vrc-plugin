@@ -732,19 +732,11 @@ export class VrcPlugin extends plugin {
     }
     cacheSet(e.user_id, 'friends', ordered)
 
-    const worldSections = sections.filter(s => s.kind === 'world')
-    const worldCount = new Set(worldSections.map(s => s.worldId || s.worldName)).size
-    const onlineCount = sections
-      .filter(s => s.kind === 'world' || s.status !== 'offline')
-      .reduce((sum, s) => sum + s.friends.length, 0)
-
     const html = VIEW.renderFriendList(sections, words.friend_list)
     const file = await renderHtml(html, { width: config.viewport.friend, quality: config.jpegQuality })
     await e.reply([
       imgSegment(file),
-      `\n共 ${ordered.length} 位好友，在线 ${onlineCount} 人${
-        worldCount ? `，分布在 ${worldCount} 个世界（${worldSections.length} 个房间）` : ''
-      }\n发送 #vrc用户 序号 可以查看某个好友的资料卡`
+      `\n共 ${ordered.length} 位好友，${VIEW.friendSummary(sections)}\n发送 #vrc用户 序号 可以查看某个好友的资料卡`
     ])
     return true
   }
