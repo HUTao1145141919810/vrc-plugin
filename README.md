@@ -27,6 +27,8 @@
 - 上游以后再更新，我大概率不会跟着追；
 - 有bug直接提issue，等不及自己fork改。
 
+**代码可能有没测出来的缺陷，请审查后再部署；别拿别人的号和生产环境冒险。**
+
 介意就别装了，用上游的NoneBot版或自行二改。
 
 ## 安装
@@ -159,8 +161,12 @@ git clone装的，主人发指令就行：
 Cookie默认用AES-256-GCM加密后才写盘，字段是`cookiesEnc`，不是能直接拿去登录的字符串。密钥单独存，不在`data/`里：
 
 - Windows：`%APPDATA%\vrc-plugin\store.key`
-- Linux、macOS：`~/.config/vrc-plugin/store.key`，权限600
-- 容器：设环境变量`VRC_STORE_KEY`（32字节，base64或64位hex），或者把`storage.keyPath`指到挂载卷里
+
+> *Linux、macOS：`~/.config/vrc-plugin/store.key`，权限600*
+>
+> *容器：设环境变量`VRC_STORE_KEY`（32字节，base64或64位hex），或者把`storage.keyPath`指到挂载卷里*
+>
+> **这两项作者没有实测过。要在 Linux、macOS 或容器里部署，请先自己验证，三思后再装。**
 
 老版本留下的明文`users.json`，插件第一次启动会自己加密写回，Cookie值没变，所以群友不用重新登录。迁移后的备份`users.json.bak`同样是密文。
 
