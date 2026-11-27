@@ -68,6 +68,21 @@ const CMD_MAP = [
 
 const ACTION_RE = /^(接受|忽略|拒绝)\s*(\d{1,3})$/
 
+/* 指令词后面能接什么：页码、序号、带空格参数，或直接结束 */
+const ARG_TAIL = {
+  result: /^\s|^\d|^[Pp]|^第/,
+  verify: /^\s|^\d|^(?:email|totp|otp)\b/i,
+  favlist: /^\s|^(?:avatar|world)\b/i
+}
+
+/* 入口只放行已知指令词，普通聊天里的 vrc 不触发 */
+const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const TRIGGER_HEADS = [...new Set([
+  ...CMD_MAP.map(([zh]) => zh),
+  '接受', '忽略', '拒绝'
+])].map(escRe)
+const VRC_TRIGGER = new RegExp(`^#?vrc\\s*(?:${TRIGGER_HEADS.join('|')})`, 'i')
+
 /* ---------------- 序号缓存（按 QQ + 类型隔离，互不覆盖） ---------------- */
 
 const searchStore = new Map() // qq -> { [kind]: { items, at } }
@@ -279,10 +294,26 @@ async function buildFriendEntries(client, friends, nowMs = Date.now()) {
   }, '好友位置装配')
   if (locationFailed) logger?.info?.(`[vrc-plugin] 好友位置：${locationFailed}/${friends.length} 条获取失败`)
 
+  // 同一个房间只查一次人数，失败的房间按「人数未知」展示
+  const uniqueRooms = [...new Set(
+    located.filter(item => item.worldId && item.location).map(item => item.location)
+  )]
+  const roomCounts = uniqueRooms.length
+    ? await mapLimit(uniqueRooms, 3, location => V.getInstanceStats(client, location), '房间人数')
+    : []
+  const roomCountByLocation = new Map(
+    uniqueRooms.map((location, i) => [location, roomCounts[i] ?? null])
+  )
+
+  const withRoomCount = located.map(item => ({
+    ...item,
+    roomUserCount: roomCountByLocation.get(item.location) ?? null
+  }))
+
   // 第二阶段：头像转 data URI（并发 8，单个 4s 超时）
   let avatarFailed = 0
   const withAvatar = config.avatarBase64
-    ? await mapLimit(located, 8, async item => {
+    ? await mapLimit(withRoomCount, 8, async item => {
         let avatar = DEFAULT_AVATAR
         try {
           avatar = await toDataUri(item.avatarUrl)
@@ -291,9 +322,9 @@ async function buildFriendEntries(client, friends, nowMs = Date.now()) {
         }
         return { ...item, avatar }
       }, '好友头像转换')
-    : located.map(item => (item ? { ...item, avatar: DEFAULT_AVATAR } : null))
+    : withRoomCount.map(item => (item ? { ...item, avatar: DEFAULT_AVATAR } : null))
 
-  if (avatarFailed) logger?.info?.(`[vrc-plugin] 好友头像：${avatarFailed}/${located.length} 张转换失败，已用默认图`)
+  if (avatarFailed) logger?.info?.(`[vrc-plugin] 好友头像：${avatarFailed}/${withRoomCount.length} 张转换失败，已用默认图`)
   return withAvatar.filter(Boolean)
 }
 
@@ -408,7 +439,7 @@ export class VrcPlugin extends plugin {
       dsc: 'VRChat 好友 / 玩家 / 世界 / 通知 / 收藏查询',
       event: 'message',
       priority: 1000,
-      rule: [{ reg: '^#?vrc', fnc: 'main' }]
+      rule: [{ reg: VRC_TRIGGER, fnc: 'main' }]
     })
     // 等启动稳定后再预热，避免和云崽自身初始化抢网络
     setTimeout(() => {
@@ -429,15 +460,20 @@ export class VrcPlugin extends plugin {
 
     let cmd = null
     let args = []
+    const explicit = raw.startsWith('#') || /^vrc\s+/i.test(raw)
     for (const [zh, code] of CMD_MAP) {
-      if (rest.startsWith(zh)) {
-        cmd = code
-        args = rest.slice(zh.length).trim().split(/\s+/).filter(Boolean)
-        break
-      }
+      if (!rest.startsWith(zh)) continue
+      const tail = rest.slice(zh.length)
+      // 指令词后面必须是空白、页码/序号，或直接结束
+      const tailOk = ARG_TAIL[code] || /^\s|^\d/
+      if (tail && !tailOk.test(tail)) continue
+      cmd = code
+      args = tail.trim().split(/\s+/).filter(Boolean)
+      break
     }
 
     if (!cmd) {
+      if (!explicit) return false
       await e.reply(`未知指令「${rest.split(/\s+/)[0]}」\n发送 #vrc帮助 查看全部指令`)
       return true
     }
@@ -528,7 +564,7 @@ export class VrcPlugin extends plugin {
         {
           title: '好友与玩家',
           items: [
-            { cmd: '#vrc全部好友', desc: '在线按世界+房间分组，离线单独一组' },
+            { cmd: '#vrc全部好友', desc: '在线按世界+房间分组，标题显示房间人数' },
             { cmd: '#vrc搜索用户 关键词', desc: '搜索玩家，出结果列表图' },
             { cmd: '#vrc结果 P2', desc: '翻页，玩家 / 世界 / 收藏都能翻' },
             { cmd: '#vrc用户 序号', desc: '看第 N 个玩家的资料卡，序号按当前页算' },
